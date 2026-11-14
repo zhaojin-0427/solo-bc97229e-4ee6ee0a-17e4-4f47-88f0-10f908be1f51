@@ -2,16 +2,26 @@
 
 上传 CSV（站点, UTC秒, 读数；全部按文本保存）-> 每次上传生成一个 Parquet；
 后台把 >=2 个 Parquet 合并成一个；目录（SQLite 目录库）原子切换；
-下载全库 CSV 使用受理时刻的文件快照，旧文件等下载结束后回收；
-崩溃重启后未切换的合并保留旧数据并清理残件，已切换的接续回收。
+下载全库 CSV 使用受理时刻的文件快照，旧文件等下载结束后回收。
 
-所有读写路径都按批流式处理，内存占用不随总行数增长。
+崩溃 / 优雅重载恢复（单 worker 重载时新旧进程会短暂共存）：
+- 每个在途合并由执行进程（owner）持有心跳；其它进程只在 owner 死亡后才收尾；
+- owner 存活时：保留其状态、临时文件与待登记输出，新 worker 正常受理请求，
+  全局仍只执行一次合并；
+- owner 退出后：未切换的标失败（保留输入、清残件），已切换的保留成功与完整输出，
+  之后可再次发起合并；
+- 清理逐个复查目录库，不删清理期间新登记的文件；孤儿回收带时间宽限并周期重试，
+  不会永久跳过。
+
+所有读写路径都按批流式处理，内存占用不随总行数增长；
+扫描/写文件阶段不持有目录库写事务，仅有秒级短事务（进度、心跳、切换）。
 """
 
 import csv
 import io
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -28,7 +38,7 @@ from werkzeug.utils import secure_filename
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 PARQUET_DIR = DATA_DIR / "parquet"      # 活动 + 已退役待回收的 parquet
-TMP_DIR = DATA_DIR / "tmp"              # 落盘中的临时 parquet（上传/合并）
+TMP_DIR = DATA_DIR / "tmp"              # 落盘中的临时文件（上传、合并输出）
 DB_PATH = DATA_DIR / "catalog.db"
 
 BATCH_ROWS = int(os.environ.get("BATCH_ROWS", "20000"))
@@ -36,6 +46,19 @@ PROGRESS_INTERVAL = 0.5                 # 合并进度落库节流（秒）
 # 演示/测试钩子：每处理一批人为延时（毫秒），便于观察进度、慢下载、崩溃恢复
 MERGE_BATCH_DELAY_MS = int(os.environ.get("MERGE_BATCH_DELAY_MS", "0"))
 DOWNLOAD_BATCH_DELAY_MS = int(os.environ.get("DOWNLOAD_BATCH_DELAY_MS", "0"))
+
+# 跨进程合并恢复：执行进程心跳 + 存活 worker 周期收尾
+HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "1.0"))
+HEARTBEAT_TTL = float(os.environ.get("MERGE_HEARTBEAT_TTL", "10"))
+RECONCILE_INTERVAL = float(os.environ.get("RECONCILE_INTERVAL", "5"))
+# 孤儿 parquet 宽限：年轻文件本轮跳过、下轮再看（周期执行，不会永久跳过）
+ORPHAN_GRACE_SEC = float(os.environ.get("ORPHAN_GRACE_SEC", "30"))
+# 上传等无归属 tmp 残件的回收宽限
+TMP_GRACE_SEC = float(os.environ.get("TMP_GRACE_SEC", "600"))
+
+# 测试钩子：合并阶段闸口目录（跨进程交错控制）；不设置则完全关闭
+MERGE_GATE_DIR = os.environ.get("MERGE_GATE_DIR") or None
+MERGE_GATE_TIMEOUT = float(os.environ.get("MERGE_GATE_TIMEOUT", "60"))
 
 SCHEMA = pa.schema([
     ("site", pa.string()),
@@ -54,12 +77,44 @@ MERGE_STATE_LABELS = {
     "failed": "失败",
 }
 
+MERGE_TMP_RE = re.compile(r"^merge-(\d+)-")
+
+# 本进程身份：合并行的 owner，用于跨进程存活判定
+WORKER_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "telemetry-merge-demo")
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024  # 4 GiB
 
-merge_lock = threading.Lock()   # 同时只执行一次合并
 reap_lock = threading.Lock()
+
+# 测试钩子：孤儿清理扫描完候选后回调（进程内单测模拟“扫描后被登记”）
+_orphan_scan_hook = None
+
+
+# ---------------------------------------------------------------- 测试闸口
+
+
+def _gate(name):
+    """测试闸口：上报 <name>.reached；若存在 <name>.arm 则等待 <name>.proceed。
+
+    仅用于回归测试精确控制跨进程“启动/提交/退出”交错；生产不设置
+    MERGE_GATE_DIR，完全无开销。等待期间合并线程阻塞，但心跳线程照常，
+    因此其它进程看到的是“owner 存活、合并仍在执行”。
+    """
+    if not MERGE_GATE_DIR:
+        return
+    d = Path(MERGE_GATE_DIR)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{name}.reached").touch()
+    if not (d / f"{name}.arm").exists():
+        return
+    deadline = time.monotonic() + MERGE_GATE_TIMEOUT
+    while not (d / f"{name}.proceed").exists():
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"闸口 {name} 等待超时")
+        time.sleep(0.05)
+
 
 # ---------------------------------------------------------------- 目录库
 
@@ -93,6 +148,9 @@ def init_db():
             progress_rows INTEGER NOT NULL DEFAULT 0,
             total_rows    INTEGER NOT NULL DEFAULT 0,
             error         TEXT,
+            owner_id      TEXT,                    -- 执行进程身份
+            owner_pid     INTEGER,                 -- 执行进程 PID（同机存活探测）
+            heartbeat_at  REAL,                    -- 执行进程心跳
             created_at    REAL NOT NULL,
             updated_at    REAL NOT NULL
         );
@@ -102,6 +160,12 @@ def init_db():
         );
         """
     )
+    # 老库就地升级：补充合并所有权/心跳列
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(merges)")}
+    for col, typ in (("owner_id", "TEXT"), ("owner_pid", "INTEGER"),
+                     ("heartbeat_at", "REAL")):
+        if col not in cols:
+            con.execute(f"ALTER TABLE merges ADD COLUMN {col} {typ}")
     con.commit()
     con.close()
 
@@ -123,6 +187,38 @@ def fsync_dir(path):
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+# ---------------------------------------------------------------- 进程存活判定
+
+
+def _pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def owner_alive(owner_pid, heartbeat_at, updated_at, now=None):
+    """执行进程是否存活。
+
+    心跳在 TTL 内即视为存活；进程已退出且错过两次心跳则快速判死，
+    不必等满 TTL（PID 复用由心跳兜底：复用后心跳仍会变陈旧）。
+    """
+    now = time.time() if now is None else now
+    age = now - (heartbeat_at or updated_at or 0.0)
+    if age > HEARTBEAT_TTL:
+        return False
+    if owner_pid and not _pid_alive(owner_pid) and age > 2 * HEARTBEAT_INTERVAL:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------- 回收
@@ -156,54 +252,178 @@ def reap_retired():
         reap_lock.release()
 
 
-def reaper_loop():
-    while True:
-        time.sleep(5)
+def _registered(path):
+    con = db()
+    try:
+        return con.execute(
+            "SELECT 1 FROM files WHERE path=?", (path,)
+        ).fetchone() is not None
+    finally:
+        con.close()
+
+
+def _is_pending_output(path):
+    con = db()
+    try:
+        return con.execute(
+            "SELECT 1 FROM merges WHERE output_path=? AND state IN"
+            " ('scanning','writing','committing')", (path,)
+        ).fetchone() is not None
+    finally:
+        con.close()
+
+
+def finalize_dead_merges(now=None):
+    """执行进程已退出的在途合并收尾（owner 存活的一律不动）。
+
+    - 未切换的：标失败、保留输入（仍 active）、清其临时文件与未登记输出；
+    - 已切换的：保留成功与完整输出，推进到 done。
+    认领用条件更新保证跨进程原子：输掉竞态说明别人已收尾或合并刚完成切换。
+    """
+    now = time.time() if now is None else now
+    con = db()
+    try:
+        actives = con.execute(
+            "SELECT * FROM merges WHERE state IN ('scanning','writing','committing')"
+        ).fetchall()
+    finally:
+        con.close()
+    for m in actives:
+        if owner_alive(m["owner_pid"], m["heartbeat_at"], m["updated_at"], now):
+            continue  # 执行进程还活着（如重载期间的旧 worker）：保持原状
+        con = db()
         try:
-            reap_retired()
+            cur = con.execute(
+                "UPDATE merges SET state='failed', error=?, updated_at=?"
+                " WHERE id=? AND state IN ('scanning','writing','committing')",
+                ("执行进程已退出，合并未完成；已保留原始文件", now, m["id"]),
+            )
+            con.commit()
+            claimed = cur.rowcount == 1
+        finally:
+            con.close()
+        if not claimed:
+            continue
+        for p in TMP_DIR.glob(f"merge-{m['id']}-*.parquet"):
+            p.unlink(missing_ok=True)
+        # 切换事务未提交 -> 输出未登记，是残件；已登记则保留完整输出
+        if m["output_path"] and not _registered(m["output_path"]):
+            (PARQUET_DIR / m["output_path"]).unlink(missing_ok=True)
+    con = db()
+    try:
+        con.execute(
+            "UPDATE merges SET state='done', updated_at=? WHERE state='switched'",
+            (now,),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def cleanup_tmp(now=None):
+    """清理 tmp 残件；在途合并（含其它存活进程执行的）的工作文件保留。"""
+    now = time.time() if now is None else now
+    con = db()
+    try:
+        active_ids = {
+            r["id"]
+            for r in con.execute(
+                "SELECT id FROM merges WHERE state IN"
+                " ('scanning','writing','committing')"
+            )
+        }
+    finally:
+        con.close()
+    for p in TMP_DIR.glob("*"):
+        try:
+            m = MERGE_TMP_RE.match(p.name)
+            if m:
+                if int(m.group(1)) in active_ids:
+                    continue  # 在途合并的工作文件（owner 可能仍在写）
+                p.unlink(missing_ok=True)
+                continue
+            if now - p.stat().st_mtime >= TMP_GRACE_SEC:
+                p.unlink(missing_ok=True)  # 上传等残件：宽限后回收
+        except OSError:
+            continue  # 下次再试
+
+
+def cleanup_orphans(now=None):
+    """回收目录库不认识的 parquet。
+
+    - 在途合并的待登记输出（output_path）不算孤儿——旧进程可能随时提交它；
+    - 宽限期内的年轻文件本轮跳过（周期执行，下轮还会再看，不会永久跳过）；
+    - 删除前逐个复查目录库：扫描之后被新登记/认领的文件绝不被删。
+    """
+    now = time.time() if now is None else now
+    con = db()
+    try:
+        known = {r["path"] for r in con.execute("SELECT path FROM files")}
+        pending = {
+            r["output_path"]
+            for r in con.execute(
+                "SELECT output_path FROM merges WHERE state IN"
+                " ('scanning','writing','committing')"
+            )
+        }
+    finally:
+        con.close()
+    candidates = []
+    for p in PARQUET_DIR.glob("*.parquet"):
+        if p.name in known or p.name in pending:
+            continue
+        try:
+            if now - p.stat().st_mtime < ORPHAN_GRACE_SEC:
+                continue
+        except OSError:
+            continue
+        candidates.append(p)
+    if _orphan_scan_hook is not None:
+        _orphan_scan_hook(candidates)
+    for p in candidates:
+        try:
+            if _registered(p.name) or _is_pending_output(p.name):
+                continue  # 扫描期间已被登记/认领
+            p.unlink(missing_ok=True)
+        except OSError:
+            continue  # 下次再试
+
+
+def reconcile_once():
+    """一轮收尾：死亡合并终结 -> 退役回收 -> tmp 残件 -> 孤儿 parquet。"""
+    finalize_dead_merges()
+    reap_retired()
+    cleanup_tmp()
+    cleanup_orphans()
+
+
+def reconcile_loop():
+    while True:
+        time.sleep(RECONCILE_INTERVAL)
+        try:
+            reconcile_once()
         except Exception:
-            app.logger.exception("reaper failed")
+            app.logger.exception("reconcile failed")
 
 
 # ---------------------------------------------------------------- 启动恢复
 
 
 def startup_recover():
-    """崩溃/中断后重启：
+    """进程启动（崩溃重启，或优雅重载拉起的新 worker）。
 
-    - 未切换的合并：保留旧数据（输入仍是 active），清除残件，标记失败；
-    - 已切换的合并：保留新数据，接续回收退役输入；
-    - 下载不跨进程存活，引用计数清零；
-    - 清理 tmp 残件与目录库不认识的孤儿 parquet。
+    与 reconcile 同一套规则：owner 存活的在途合并保持原状（状态、临时文件、
+    待登记输出），owner 已退出的在此收尾；下载不跨进程存活（重载开始时
+    无在途上传/下载），引用计数清零。
     """
     init_db()
-    now = time.time()
     con = db()
     try:
         con.execute("DELETE FROM file_refs")
-        interrupted = con.execute(
-            "SELECT id FROM merges WHERE state IN ('scanning','writing','committing')"
-        ).fetchall()
-        for m in interrupted:
-            con.execute(
-                "UPDATE merges SET state='failed', error=?, updated_at=? WHERE id=?",
-                ("进程中断，合并未完成；已保留原始文件", now, m["id"]),
-            )
-        con.execute(
-            "UPDATE merges SET state='done', updated_at=? WHERE state='switched'",
-            (now,),
-        )
         con.commit()
-        known = {r["path"] for r in con.execute("SELECT path FROM files")}
     finally:
         con.close()
-
-    for p in TMP_DIR.glob("*"):
-        p.unlink(missing_ok=True)
-    for p in PARQUET_DIR.glob("*.parquet"):
-        if p.name not in known:
-            p.unlink(missing_ok=True)
-    reap_retired()
+    reconcile_once()
 
 
 # ---------------------------------------------------------------- CSV -> Parquet
@@ -249,6 +469,7 @@ def csv_stream_to_parquet(stream, out_path):
 
 
 def set_merge(merge_id, **fields):
+    """非状态字段更新（进度等）；不改变状态机，不会复活已收尾的合并。"""
     fields["updated_at"] = time.time()
     sql = "UPDATE merges SET " + ", ".join(f"{k}=?" for k in fields) + " WHERE id=?"
     con = db()
@@ -259,16 +480,64 @@ def set_merge(merge_id, **fields):
         con.close()
 
 
+def cas_merge(merge_id, from_states, **fields):
+    """条件状态推进：仅当仍处于 from_states 才生效。
+
+    防止执行进程在合并已被其它 worker 收尾后继续改写状态（僵尸写）。
+    """
+    fields["updated_at"] = time.time()
+    sql = (
+        "UPDATE merges SET " + ", ".join(f"{k}=?" for k in fields)
+        + f" WHERE id=? AND state IN ({','.join('?' * len(from_states))})"
+    )
+    con = db()
+    try:
+        cur = con.execute(sql, (*fields.values(), merge_id, *from_states))
+        con.commit()
+        return cur.rowcount == 1
+    finally:
+        con.close()
+
+
+class MergeLost(Exception):
+    """执行权已被回收（本进程被判死亡）：放弃执行且不覆盖收尾结果。"""
+
+
+def _heartbeat_loop(merge_id, stop):
+    """合并执行期间续心跳；扫描/写出卡顿也不影响存活判定。"""
+    while not stop.wait(HEARTBEAT_INTERVAL):
+        try:
+            con = db()
+            try:
+                con.execute(
+                    "UPDATE merges SET heartbeat_at=? WHERE id=? AND state IN"
+                    " ('scanning','writing','committing')",
+                    (time.time(), merge_id),
+                )
+                con.commit()
+            finally:
+                con.close()
+        except Exception:
+            app.logger.exception("merge %s heartbeat failed", merge_id)
+
+
 def run_merge(merge_id, inputs, out_name):
     """扫描/写文件阶段不持有目录库写事务；切换是单个短事务。"""
     tmp_path = TMP_DIR / f"merge-{merge_id}-{uuid.uuid4().hex}.parquet"
     final_path = PARQUET_DIR / out_name
+    stop_hb = threading.Event()
+    hb = threading.Thread(
+        target=_heartbeat_loop, args=(merge_id, stop_hb), daemon=True
+    )
+    hb.start()
     try:
         # 扫描：只读 parquet 页脚统计总行数
         total = 0
         for inp in inputs:
             total += pq.ParquetFile(PARQUET_DIR / inp["path"]).metadata.num_rows
-        set_merge(merge_id, state="writing", total_rows=total)
+        if not cas_merge(merge_id, ("scanning",), state="writing", total_rows=total):
+            raise MergeLost()
+        _gate("scanned")
 
         # 写出：流式逐批，内存不随总行数增长
         writer = pq.ParquetWriter(tmp_path, SCHEMA, compression="zstd")
@@ -292,18 +561,23 @@ def run_merge(merge_id, inputs, out_name):
             writer.close()
 
         # 新文件完整落盘（fsync + 原子改名）后才切换目录
+        _gate("written")
         fsync_file(tmp_path)
         os.replace(tmp_path, final_path)
         fsync_dir(PARQUET_DIR)
+        _gate("renamed")
 
         # 目录切换：单个短事务，只替换所选文件；期间新上传不受影响
-        set_merge(merge_id, state="committing", progress_rows=written)
+        if not cas_merge(merge_id, ("writing",), state="committing",
+                         progress_rows=written):
+            raise MergeLost()
         con = db()
         try:
             con.execute("BEGIN IMMEDIATE")
             con.execute(
                 "INSERT INTO files(name,path,rows,state,created_at) VALUES (?,?,?,?,?)",
-                (f"merged-{merge_id}.parquet", out_name, written, "active", time.time()),
+                (f"merged-{merge_id}.parquet", out_name, written, "active",
+                 time.time()),
             )
             n = con.execute(
                 "UPDATE files SET state='retired' WHERE state='active' AND id IN (%s)"
@@ -312,38 +586,41 @@ def run_merge(merge_id, inputs, out_name):
             ).rowcount
             if n != len(inputs):
                 raise RuntimeError("输入文件状态已变化，放弃切换")
-            con.execute(
+            cur = con.execute(
                 "UPDATE merges SET state='switched', progress_rows=?, output_rows=?,"
-                " updated_at=? WHERE id=?",
+                " updated_at=? WHERE id=? AND state='committing'",
                 (written, written, time.time(), merge_id),
             )
+            if cur.rowcount != 1:
+                raise MergeLost("合并已被回收，放弃切换")
             con.commit()
         except Exception:
             con.rollback()
             raise
         finally:
             con.close()
+        _gate("committed")
 
-        set_merge(merge_id, state="done")
+        cas_merge(merge_id, ("switched",), state="done")
         reap_retired()
+    except MergeLost as e:
+        app.logger.warning("merge %s lost: %s", merge_id, e)
+        tmp_path.unlink(missing_ok=True)
+        if not _registered(out_name):
+            final_path.unlink(missing_ok=True)
     except Exception as e:
         app.logger.exception("merge %s failed", merge_id)
         tmp_path.unlink(missing_ok=True)
         try:  # 切换事务未提交 -> 输出文件是残件，清除；已提交则保留新数据
-            con = db()
-            try:
-                known = con.execute(
-                    "SELECT 1 FROM files WHERE path=?", (out_name,)
-                ).fetchone()
-            finally:
-                con.close()
-            if not known:
+            if not _registered(out_name):
                 final_path.unlink(missing_ok=True)
         except Exception:
             pass
-        set_merge(merge_id, state="failed", error=str(e)[:500])
+        cas_merge(merge_id, MERGE_ACTIVE_STATES, state="failed",
+                  error=str(e)[:500])
     finally:
-        merge_lock.release()
+        stop_hb.set()
+        hb.join(timeout=2)
 
 
 # ---------------------------------------------------------------- 下载引用计数
@@ -458,8 +735,12 @@ def merge():
     if len(ids) < 2:
         flash("请至少选择两个文件进行合并")
         return redirect(url_for("index"))
+    now = time.time()
+    out_name = f"{uuid.uuid4().hex}.parquet"
     con = db()
     try:
+        # 单个写事务内检查并登记：跨进程也保证全局只受理一个合并
+        con.execute("BEGIN IMMEDIATE")
         rows = con.execute(
             "SELECT id, path, rows FROM files WHERE state='active' AND id IN (%s)"
             % ",".join("?" * len(ids)),
@@ -469,33 +750,32 @@ def merge():
             "SELECT COUNT(*) c FROM merges WHERE state IN ('scanning','writing','committing')"
         ).fetchone()["c"]
         if len(rows) != len(ids):
+            con.rollback()
             flash("所选文件不存在或已被合并，请刷新后重试")
             return redirect(url_for("index"))
-        if busy or not merge_lock.acquire(blocking=False):
+        if busy:
+            con.rollback()
             flash("已有合并任务正在进行，请稍候")
             return redirect(url_for("index"))
+        cur = con.execute(
+            "INSERT INTO merges(state,input_ids,output_path,progress_rows,total_rows,"
+            "owner_id,owner_pid,heartbeat_at,created_at,updated_at)"
+            " VALUES ('scanning',?,?,0,0,?,?,?,?,?)",
+            (json.dumps([r["id"] for r in rows]), out_name,
+             WORKER_ID, os.getpid(), now, now, now),
+        )
+        merge_id = cur.lastrowid
+        con.commit()
     finally:
         con.close()
+    inputs = [dict(r) for r in rows]
     try:
-        now = time.time()
-        out_name = f"{uuid.uuid4().hex}.parquet"
-        con = db()
-        try:
-            cur = con.execute(
-                "INSERT INTO merges(state,input_ids,output_path,progress_rows,total_rows,"
-                "created_at,updated_at) VALUES ('scanning',?,?,0,0,?,?)",
-                (json.dumps([r["id"] for r in rows]), out_name, now, now),
-            )
-            merge_id = cur.lastrowid
-            con.commit()
-        finally:
-            con.close()
-        inputs = [dict(r) for r in rows]
         threading.Thread(
             target=run_merge, args=(merge_id, inputs, out_name), daemon=True
         ).start()
     except Exception:
-        merge_lock.release()
+        cas_merge(merge_id, MERGE_ACTIVE_STATES, state="failed",
+                  error="无法启动合并线程")
         raise
     flash(f"合并任务 #{merge_id} 已启动（{len(ids)} 个文件）")
     return redirect(url_for("index"))
@@ -517,15 +797,21 @@ def api_status():
         con.close()
     payload = {"files": agg["c"], "rows": agg["s"], "merge": None}
     if m:
+        active = m["state"] in MERGE_ACTIVE_STATES
         payload["merge"] = {
             "id": m["id"],
             "state": m["state"],
             "state_label": MERGE_STATE_LABELS.get(m["state"], m["state"]),
-            "active": m["state"] in MERGE_ACTIVE_STATES,
+            "active": active,
             "progress_rows": m["progress_rows"],
             "total_rows": m["total_rows"],
             "output_rows": m["output_rows"],
             "error": m["error"],
+            # 在途合并的执行进程是否存活；已退出则存活 worker 会自动收尾
+            "owner_alive": (
+                owner_alive(m["owner_pid"], m["heartbeat_at"], m["updated_at"])
+                if active else None
+            ),
         }
     return jsonify(payload)
 
@@ -623,8 +909,12 @@ async function poll(){
     const btn = document.getElementById('mergeBtn');
     if(j.merge){
       const m = j.merge;
-      info.textContent = '任务 #' + m.id + '：' + m.state_label +
+      let txt = '任务 #' + m.id + '：' + m.state_label +
         '，已写入 ' + m.progress_rows + '/' + m.total_rows + ' 行';
+      if(m.active && m.owner_alive === false){
+        txt += '（执行进程已退出，正在自动收尾…）';
+      }
+      info.textContent = txt;
       bar.style.width = m.total_rows > 0 ? (100*m.progress_rows/m.total_rows)+'%'
                                          : (m.state==='done' ? '100%' : '0%');
       err.textContent = m.error || '';
@@ -674,7 +964,7 @@ def index():
 for _d in (DATA_DIR, PARQUET_DIR, TMP_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 startup_recover()
-threading.Thread(target=reaper_loop, daemon=True).start()
+threading.Thread(target=reconcile_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), threaded=True)

@@ -11,6 +11,11 @@ services:
       # 慢下载不阻塞合并、以及 kill 容器后的崩溃恢复。
       # MERGE_BATCH_DELAY_MS: "100"
       # DOWNLOAD_BATCH_DELAY_MS: "100"
+      # 跨进程合并恢复参数（默认值见 README，一般无需调整）：
+      # HEARTBEAT_INTERVAL: "1"        # 合并执行进程心跳间隔（秒）
+      # MERGE_HEARTBEAT_TTL: "10"      # 心跳超此时长视为执行进程已退出
+      # RECONCILE_INTERVAL: "5"        # 存活 worker 周期收尾间隔
+      # ORPHAN_GRACE_SEC: "30"         # 孤儿 parquet 回收宽限
     volumes:
       - telemetry-data:/data
     restart: unless-stopped
